@@ -8,6 +8,7 @@ import { filterSchema } from '../utils/filter-schema';
 import notifyUser from '../utils/notify-user';
 import saveToFile from '../utils/save-file';
 import { validate_data, validate_migration, validate_system } from '../utils/validate';
+import { createWebhookContext, generateSessionId } from '../utils/webhook';
 import { enhancedFetch, initLimiter } from './api';
 import extractContent from './composables/extract-data';
 import extractSystemData from './composables/extract-system';
@@ -242,6 +243,20 @@ export default defineEndpoint({
 
 				res.write(isDryRun ? '## Staring Dry Run Extraction\r\n\r\n' : '## Staring Extraction\r\n\r\n');
 
+				// Initialize webhook context for migration events
+				const migrationStartTime = Date.now();
+				const webhook = createWebhookContext({
+					sessionId: generateSessionId(),
+					sourceUrl: env['PUBLIC_URL'] || 'unknown',
+					targetUrl: baseURL,
+					userEmail: accountability.user ? String(accountability.user) : undefined,
+					dryRun: isDryRun,
+					scope,
+				});
+
+				// Send migration:start event
+				await webhook.send('migration:start');
+
 				// Create Working Directory
 				const folderName = `Migration ${new Date().toISOString()}`;
 
@@ -304,16 +319,23 @@ export default defineEndpoint({
 					let schemaMigrationOk = true;
 					if (scope.schema) {
 						res.write(`<div class="pending"><h3>${spinner} Applying Schema</h3>\r\n\r\n`);
+						await webhook.stepStart('schema');
 						const response = await migrateSchema({ res, client, schema: currentSchema, dry_run: isDryRun, force: scope.force }); // Can be { status: 204 } if there is no change
 
 						if ('errors' in response) {
 							const message = Array.isArray(response.errors) && response.errors.length > 0 ? response.errors[0]?.message : 'Unknown';
 							await notifyUser(notificationService, accountability, response);
+							await webhook.stepError('schema', message || 'Unknown error');
 							res.write(`</div><h3 class="error">${Icon} Schema Failed to Apply</h3>\r\n\r\n`);
 							res.write(`Error Occurred: ${message}\r\n\r\n`);
 							schemaMigrationOk = false;
 						}
 						else {
+							await webhook.stepComplete('schema', {
+								collections: currentSchema.collections?.length,
+								fields: currentSchema.fields?.length,
+								relations: currentSchema.relations?.length,
+							});
 							res.write(`</div><h3 class="done">${Icon} Schema Applied</h3>\r\n\r\n`);
 						}
 					}
@@ -326,6 +348,7 @@ export default defineEndpoint({
 						// Step 2.2: Users (with granular options)
 						if (scope.users) {
 							res.write(`<div class="pending"><h3>${spinner} Migrating Users</h3>\r\n\r\n`);
+							await webhook.stepStart('users');
 
 							// Get granular options with defaults
 							const granular = scope.usersGranular || {
@@ -380,6 +403,17 @@ export default defineEndpoint({
 
 							const userMigrationValid = await validate_migration(migrationResponses);
 
+							if (userMigrationValid) {
+								await webhook.stepComplete('users', {
+									roles: systemFetch.roles?.length,
+									users: systemFetch.users?.length,
+									policies: systemFetch.policies?.length,
+								});
+							}
+							else {
+								await webhook.stepError('users', 'Users migration failed');
+							}
+
 							res.write(userMigrationValid ? `</div><h3 class="done">${Icon} Users Migrated</h3>\r\n\r\n` : `</div><h3 class="error">${Icon} Users Migration Failed</h3>\r\n\r\n`);
 						}
 						else {
@@ -392,6 +426,7 @@ export default defineEndpoint({
 
 						if (shouldMigrateFiles) {
 							res.write(`<div class="pending"><h3>${spinner} Migrating Files</h3>\r\n\r\n`);
+							await webhook.stepStart('files');
 							const folder_response = await migrateFolders({ res, client, folders: systemFetch.folders, dry_run: isDryRun });
 							const file_response = await migrateFiles({ res, client, service: assetService, files: dataFetch.files, dry_run: isDryRun });
 
@@ -399,6 +434,16 @@ export default defineEndpoint({
 								folder_response,
 								file_response,
 							]);
+
+							if (fileMigrationValid) {
+								await webhook.stepComplete('files', {
+									folders: systemFetch.folders?.length,
+									files: dataFetch.files?.length,
+								});
+							}
+							else {
+								await webhook.stepError('files', 'Files migration partially failed');
+							}
 
 							res.write(fileMigrationValid ? `</div><h3 class="done">${Icon} Files Migrated</h3>\r\n\r\n` : `</div><h3 class="error">${Icon} Files Migration Partially Failed</h3>\r\n\r\n`);
 						}
@@ -416,16 +461,18 @@ export default defineEndpoint({
 
 						// Step 2.4: Content
 						if (scope.content) {
+							await webhook.stepStart('content');
 							res.write(`<div class="pending"><h3>${spinner} Removing Field Requirements</h3>\r\n\r\n`);
 							const field_response = await updateRequiredFields({ res, client, service: fieldService, collections: dataFetch.collections, dry_run: isDryRun, task: 'remove' });
 							const fieldUpdateValid = await validate_migration([field_response]);
 							res.write(fieldUpdateValid ? `</div><h3 class="done">${Icon} Field Requirements Removed</h3>\r\n\r\n` : `</div><h3 class="error">${Icon} Failed to Remove Field Requirements</h3>\r\n\r\n`);
 
+							let contentMigrationValid = false;
 							if (fieldUpdateValid) {
 								// Step 2.5: Data
 								res.write(`<div class="pending"><h3>${spinner} Migrating Collections</h3>\r\n\r\n`);
 								const content_response = await migrateData({ res, client, fullData: dataFetch.fullData, singletons: dataFetch.singletons, dry_run: isDryRun });
-								const contentMigrationValid = await validate_migration([content_response]);
+								contentMigrationValid = await validate_migration([content_response]);
 								res.write(contentMigrationValid ? `</div><h3 class="done">${Icon} Collections Migrated</h3>\r\n\r\n` : `</div><h3 class="error">${Icon} Collections Migration Failed</h3>\r\n\r\n`);
 							}
 
@@ -434,6 +481,15 @@ export default defineEndpoint({
 							const fields_response = await updateRequiredFields({ res, client, service: fieldService, collections: dataFetch.collections, dry_run: isDryRun, task: 'add' });
 							const fieldsUpdateValid = await validate_migration([fields_response]);
 							res.write(fieldsUpdateValid ? `</div><h3 class="done">${Icon} Required Fields Updated</h3>\r\n\r\n` : `</div><h3 class="error">${Icon} Failed to Update Required Fields</h3>\r\n\r\n`);
+
+							if (contentMigrationValid) {
+								await webhook.stepComplete('content', {
+									created: dataFetch.fullData ? Object.keys(dataFetch.fullData).length : 0,
+								});
+							}
+							else {
+								await webhook.stepError('content', 'Content migration failed');
+							}
 						}
 						else {
 							res.write(`<h3 class="skipped">${Icon} Content Skipped</h3>\r\n\r\n`);
@@ -518,11 +574,26 @@ export default defineEndpoint({
 						}
 					} // End of schemaMigrationOk block
 
+					// Send migration:complete event
+					await webhook.send('migration:complete', {
+						summary: {
+							duration_ms: Date.now() - migrationStartTime,
+						},
+					});
+
 					res.write(`## Migration ${isDryRun ? 'Dry Run' : ''} Complete\r\n\r\n`);
 					res.write(`The files can be download from the [file library](/admin/files/folders/${folder}).\r\n\r\n`);
 					res.end();
 				}
 				catch (error) {
+					// Send migration:error event
+					await webhook.send('migration:error', {
+						error: {
+							message: error instanceof Error ? error.message : 'Unknown error',
+							details: error instanceof Error ? { stack: error.stack } : undefined,
+						},
+					});
+
 					res.write('An unknown error has occured. See log for details');
 					res.end();
 					console.error(error);
